@@ -2,7 +2,7 @@
 // Requires: CRIC_API_KEY set in Vercel Environment Variables
 // Sign up free at https://cricapi.com (100 req/day on free tier)
 
-const KEY  = process.env.CRIC_API_KEY;
+const KEY  = process.env.CRICAPI_KEY;
 const BASE = 'https://api.cricapi.com/v1';
 const IPL  = /ipl|indian premier/i;
 
@@ -113,7 +113,7 @@ export default async function handler(req, res) {
     return res.json({
       matches: [],
       fetchedAt: Date.now(),
-      error: 'CRIC_API_KEY not set. Add it in Vercel → Settings → Environment Variables.',
+      error: 'CRICAPI_KEY not set. Add it in Vercel → Settings → Environment Variables.',
     });
   }
 
