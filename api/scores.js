@@ -1,22 +1,25 @@
 // api/scores.js — Vercel Serverless Function
-// Uses series endpoint to get full IPL schedule (not just live matches)
+// Uses ESPN Cricinfo's unofficial API — NO API KEY REQUIRED
 
-const KEY  = process.env.CRICAPI_KEY;
-const BASE = 'https://api.cricapi.com/v1';
-const IPL  = /ipl|indian premier/i;
+const IPL_SERIES_ID = 1510719; // IPL 2026 on ESPN Cricinfo
+const ESPN = 'https://hs-consumer-api.espncricinfo.com/v1/pages';
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Origin': 'https://www.espncricinfo.com',
+  'Referer': 'https://www.espncricinfo.com/',
+};
 
-async function get(path) {
-  const sep = path.includes('?') ? '&' : '?';
-  const r = await fetch(`${BASE}${path}${sep}apikey=${KEY}`);
-  if (!r.ok) throw new Error(`CricAPI ${r.status}: ${path}`);
-  const d = await r.json();
-  if (d.status !== 'success') throw new Error(`CricAPI error: ${d.message || d.status}`);
-  return d;
+async function espn(path) {
+  const r = await fetch(`${ESPN}${path}`, { headers: HEADERS });
+  if (!r.ok) throw new Error(`ESPN ${r.status} — ${path}`);
+  return r.json();
 }
 
 function norm(n) { return (n || '').toLowerCase().replace(/[^a-z]/g, ''); }
 
-// ── Dream11 Fantasy Points ────────────────────────────────────────
+// ── Dream11 Points ─────────────────────────────────────────────────
 function fantasyPts(bat, bowl, inXI) {
   let p = inXI ? 4 : 0;
   const r = bat.r || 0, b = bat.b || 0;
@@ -24,7 +27,7 @@ function fantasyPts(bat, bowl, inXI) {
   p += (bat['4s'] || 0);
   p += (bat['6s'] || 0) * 2;
   if (r >= 100) p += 16; else if (r >= 50) p += 8; else if (r >= 30) p += 4;
-  const dismissed = bat.dismissal && !bat.dismissal.toLowerCase().includes('not out');
+  const dismissed = bat.dismissal && !/not out/i.test(bat.dismissal);
   if (r === 0 && dismissed) p -= 2;
   if (b >= 10) {
     const sr = (r / b) * 100;
@@ -43,128 +46,169 @@ function fantasyPts(bat, bowl, inXI) {
   return Math.round(p);
 }
 
-function extractPlayerPts(scorecard) {
+// ── Parse ESPN scorecard innings to player points ─────────────────
+function extractPts(innings) {
   const pts = {}, seenBat = new Set();
-  (scorecard || []).forEach(inn => {
-    (inn.batting || []).forEach(b => {
-      const name = b.batsman?.name || b.name; if (!name) return;
+  (innings || []).forEach(inn => {
+    // Batting — ESPN uses batters[] or battingPerformances[]
+    const batters = inn.batters || inn.battingPerformances || inn.batting || [];
+    batters.forEach(b => {
+      const name = b.player?.name || b.batter?.name || b.batsman?.name || b.name;
+      if (!name) return;
       const k = norm(name);
-      const isFirst = !seenBat.has(k); seenBat.add(k);
-      pts[k] = (pts[k] || 0) + fantasyPts(b, {}, isFirst);
+      const first = !seenBat.has(k); seenBat.add(k);
+      const bat = {
+        r: b.runs ?? b.runsScored ?? b.r ?? 0,
+        b: b.balls ?? b.ballsFaced ?? b.b ?? 0,
+        '4s': b.fours ?? b['4s'] ?? 0,
+        '6s': b.sixes ?? b['6s'] ?? 0,
+        dismissal: b.dismissal ?? b.howDismissed ?? b.how_out ?? ''
+      };
+      pts[k] = (pts[k] || 0) + fantasyPts(bat, {}, first);
     });
-    (inn.bowling || []).forEach(bw => {
-      const name = bw.bowler?.name || bw.name; if (!name) return;
+    // Bowling — ESPN uses bowlers[] or bowlingPerformances[]
+    const bowlers = inn.bowlers || inn.bowlingPerformances || inn.bowling || [];
+    bowlers.forEach(bw => {
+      const name = bw.player?.name || bw.bowler?.name || bw.name;
+      if (!name) return;
       const k = norm(name);
-      pts[k] = (pts[k] || 0) + fantasyPts({}, bw, false);
+      const bowl = {
+        w: bw.wickets ?? bw.w ?? 0,
+        o: bw.overs ?? bw.o ?? 0,
+        r: bw.conceded ?? bw.runs ?? bw.r ?? 0,
+        maiden: bw.maidens ?? bw.maiden ?? 0
+      };
+      pts[k] = (pts[k] || 0) + fantasyPts({}, bowl, false);
     });
   });
   return pts;
 }
 
-function fmtScore(scores, idx) {
-  const s = (scores || [])[idx];
-  return s ? { s: `${s.r}/${s.w}`, o: String(s.o || '') } : { s: '', o: '' };
+// ── Parse ESPN innings for scorecard display ───────────────────────
+function parseScorecard(innings) {
+  return (innings || []).map(inn => {
+    const batters = inn.batters || inn.battingPerformances || inn.batting || [];
+    const bowlers = inn.bowlers || inn.bowlingPerformances || inn.bowling || [];
+    const battingTeam = inn.battingTeam?.name || inn.team?.name || inn.inning || '';
+    const runs = inn.totalRuns ?? inn.runs ?? inn.totalScore ?? '';
+    const wickets = inn.totalWickets ?? inn.wickets ?? '';
+    const overs = inn.totalOvers ?? inn.overs ?? '';
+    return {
+      inning: battingTeam,
+      totalRuns: runs,
+      totalWickets: wickets,
+      totalOvers: overs,
+      batting: batters.map(b => ({
+        name: b.player?.name || b.batter?.name || b.batsman?.name || b.name || '',
+        r: b.runs ?? b.runsScored ?? b.r ?? 0,
+        b: b.balls ?? b.ballsFaced ?? b.b ?? 0,
+        '4s': b.fours ?? b['4s'] ?? 0,
+        '6s': b.sixes ?? b['6s'] ?? 0,
+        dismissal: b.dismissal ?? b.howDismissed ?? b.how_out ?? 'not out'
+      })),
+      bowling: bowlers.map(bw => ({
+        name: bw.player?.name || bw.bowler?.name || bw.name || '',
+        o: bw.overs ?? bw.o ?? 0,
+        r: bw.conceded ?? bw.runs ?? bw.r ?? 0,
+        w: bw.wickets ?? bw.w ?? 0,
+        maiden: bw.maidens ?? bw.maiden ?? 0
+      }))
+    };
+  });
 }
 
-function toMatch(m, sc) {
-  const status = m.matchStarted && !m.matchEnded ? 'live'
-               : m.matchEnded ? 'completed' : 'upcoming';
+// ── Convert ESPN match object to app format ────────────────────────
+function toMatch(m, scorecardData) {
   const teams = m.teams || [];
-  const { s: s1, o: o1 } = fmtScore(m.score, 0);
-  const { s: s2, o: o2 } = fmtScore(m.score, 1);
-  const toss = m.toss?.winner
-    ? `${m.toss.winner} won the toss, elected to ${m.toss.decision}` : '';
-  const playerPoints = sc ? extractPlayerPts(sc.data?.scorecard) : {};
+  const t1 = teams[0]?.team || {};
+  const t2 = teams[1]?.team || {};
+  const t1name = t1.longName || t1.name || t1.abbreviation || '';
+  const t2name = t2.longName || t2.name || t2.abbreviation || '';
+
+  // Scores from inningScores or teams
+  const inn1 = teams[0]?.inningScores?.[0] || {};
+  const inn2 = teams[1]?.inningScores?.[0] || {};
+  const s1 = inn1.runs !== undefined ? `${inn1.runs}/${inn1.wickets ?? ''}` : '';
+  const o1 = inn1.overs !== undefined ? String(inn1.overs) : '';
+  const s2 = inn2.runs !== undefined ? `${inn2.runs}/${inn2.wickets ?? ''}` : '';
+  const o2 = inn2.overs !== undefined ? String(inn2.overs) : '';
+
+  const isLive = !!(m.isCurrentMatch || m.liveScore || m.matchState === 'live');
+  const isDone = !!(m.isCompleted || m.matchState === 'complete' || m.matchState === 'result');
+  const status = isLive ? 'live' : isDone ? 'completed' : 'upcoming';
+
+  const innings = scorecardData?.content?.scorecard
+    || scorecardData?.content?.innings
+    || scorecardData?.innings
+    || [];
+
+  const tossText = m.tossResults
+    ? `${m.tossResults.winnerTeamName} won toss, elected to ${m.tossResults.decision}`
+    : '';
+
   return {
-    id: m.id, t1: teams[0] || '', t2: teams[1] || '',
-    f1: teams[0] || '', f2: teams[1] || '',
-    s1, s2, o1, o2, status, toss,
-    date: m.dateTimeGMT || m.date || '',
-    venue: m.venue || '',
-    result: m.status || '',
-    scorecard: sc?.data?.scorecard || [],
-    playerPoints,
+    id: String(m.objectId || m.id),
+    espnId: String(m.objectId || m.id),
+    t1: t1name, t2: t2name,
+    f1: t1name, f2: t2name,
+    s1, s2, o1, o2, status,
+    date: m.startTime || m.startDate || '',
+    venue: m.ground?.longName || m.ground?.name || m.groundDisplayName || '',
+    result: m.statusText || m.status || '',
+    toss: tossText,
+    scorecard: parseScorecard(innings),
+    playerPoints: extractPts(innings),
   };
 }
 
-// ── Handler ───────────────────────────────────────────────────────
+// ── Main handler ───────────────────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
 
-  if (!KEY) {
-    return res.json({ matches: [], fetchedAt: Date.now(), error: 'CRICAPI_KEY not set.' });
-  }
-
   const debug = req.query?.debug === 'true';
 
   try {
-    let iplMatches = [];
+    // Fetch full IPL 2026 schedule
+    const schedData = await espn(`/series/schedule?seriesId=${IPL_SERIES_ID}`);
+    const allMatches = schedData?.content?.matches || schedData?.matches || [];
 
-    // ── Strategy 1: Find IPL series and get all its matches ───────
-    try {
-      const serRes = await get('/series?offset=0');
-      const allSeries = serRes.data || [];
-      if (debug) return res.json({ debug: true, allSeries: allSeries.map(s => ({ id: s.id, name: s.name })) });
-
-      const iplSeries = allSeries.find(s => IPL.test(s.name || ''));
-      if (iplSeries) {
-        const infoRes = await get(`/series_info?id=${iplSeries.id}`);
-        const info = infoRes.data || {};
-        // matchList gives all matches in the series
-        iplMatches = info.matchList || info.match_list || info.matches || [];
-      }
-    } catch (e) {
-      console.warn('Series fetch failed:', e.message);
-    }
-
-    // ── Strategy 2: Fall back to currentMatches + matches ─────────
-    if (!iplMatches.length) {
-      try {
-        const [cur, recent] = await Promise.all([
-          get('/currentMatches?offset=0').catch(() => ({ data: [] })),
-          get('/matches?offset=0').catch(() => ({ data: [] })),
-        ]);
-        const all = [...(cur.data || []), ...(recent.data || [])];
-        const seen = new Set();
-        all.forEach(m => {
-          if (!seen.has(m.id)) {
-            seen.add(m.id);
-            if (IPL.test(m.name || '') || IPL.test(m.seriesName || ''))
-              iplMatches.push(m);
-          }
-        });
-      } catch (e) {
-        console.warn('Fallback fetch failed:', e.message);
-      }
+    if (debug) {
+      const sample = allMatches[0];
+      return res.json({
+        debug: true,
+        total: allMatches.length,
+        firstMatch: sample,
+        keys: sample ? Object.keys(sample) : []
+      });
     }
 
     // Sort: live → upcoming → completed
     const order = { live: 0, upcoming: 1, completed: 2 };
-    iplMatches.sort((a, b) => {
-      const sa = a.matchStarted && !a.matchEnded ? 'live' : a.matchEnded ? 'completed' : 'upcoming';
-      const sb = b.matchStarted && !b.matchEnded ? 'live' : b.matchEnded ? 'completed' : 'upcoming';
-      if (order[sa] !== order[sb]) return order[sa] - order[sb];
-      // within upcoming: sort by date ascending
-      if (sa === 'upcoming') return new Date(a.dateTimeGMT || a.date || 0) - new Date(b.dateTimeGMT || b.date || 0);
-      // within completed: most recent first
-      return new Date(b.dateTimeGMT || b.date || 0) - new Date(a.dateTimeGMT || a.date || 0);
+    allMatches.sort((a, b) => {
+      const getS = m => m.isCurrentMatch ? 'live' : (m.isCompleted ? 'completed' : 'upcoming');
+      const diff = order[getS(a)] - order[getS(b)];
+      if (diff !== 0) return diff;
+      return new Date(a.startTime || 0) - new Date(b.startTime || 0);
     });
 
-    // Enrich live/completed matches with scorecards
+    // Enrich started matches with scorecards (max 10 to stay fast)
     const enriched = await Promise.all(
-      iplMatches.slice(0, 14).map(async m => {
-        let sc = null;
-        if (m.matchStarted) {
-          try { sc = await get(`/match_scorecard?id=${m.id}`); } catch (e) { }
+      allMatches.slice(0, 20).map(async m => {
+        const matchId = m.objectId || m.id;
+        let scData = null;
+        if (m.isCompleted || m.isCurrentMatch) {
+          try {
+            scData = await espn(`/match/scorecard?seriesId=${IPL_SERIES_ID}&matchId=${matchId}`);
+          } catch (e) { /* scorecard optional */ }
         }
-        return toMatch(m, sc);
+        return toMatch(m, scData);
       })
     );
 
-    res.json({ matches: enriched, total: iplMatches.length, fetchedAt: Date.now() });
+    res.json({ matches: enriched, total: allMatches.length, fetchedAt: Date.now() });
   } catch (e) {
-    console.error('scores error:', e);
+    console.error('ESPN handler error:', e);
     res.status(500).json({ error: e.message, matches: [], fetchedAt: Date.now() });
   }
 }
