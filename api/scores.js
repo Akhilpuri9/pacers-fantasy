@@ -1,149 +1,165 @@
-// api/scores.js
-// Fetches IPL 2026 live scores + per-player batting/bowling stats
-// so the frontend can calculate fantasy points without a second API call.
+// api/scores.js  — Vercel Serverless Function
+// Requires: CRIC_API_KEY set in Vercel Environment Variables
+// Sign up free at https://cricapi.com (100 req/day on free tier)
 
-const KEY = process.env.CRICAPI_KEY;
-const IPL_ID = "d5a498c8-7596-4b93-8ab0-e0efc3345312";
+const KEY  = process.env.CRIC_API_KEY;
+const BASE = 'https://api.cricapi.com/v1';
+const IPL  = /ipl|indian premier/i;
 
-let cache = { data: null, ts: 0 };
-const TTL = 60_000; // 60 s
-
-async function j(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`CricAPI ${r.status}`);
+async function get(path) {
+  const r = await fetch(`${BASE}${path}&apikey=${KEY}`);
+  if (!r.ok) throw new Error(`CricAPI ${r.status}: ${path}`);
   return r.json();
 }
 
-// Dream11-style fantasy points
-function calcPoints(bat, bowl, field) {
-  let pts = 0;
-  if (bat) {
-    pts += (bat.runs || 0);
-    pts += (bat.fours || 0) * 1;
-    pts += (bat.sixes || 0) * 2;
-    if (bat.runs >= 100) pts += 16;
-    else if (bat.runs >= 50) pts += 8;
-    if (bat.runs === 0 && bat.balls > 0) pts -= 2;
-    const sr = bat.balls > 0 ? (bat.runs / bat.balls) * 100 : 0;
-    if (bat.balls >= 10) {
-      if (sr >= 170) pts += 6;
-      else if (sr >= 150) pts += 4;
-      else if (sr >= 130) pts += 2;
-      else if (sr < 70) pts -= 2;
-      else if (sr < 60) pts -= 4;
-      else if (sr < 50) pts -= 6;
-    }
+function norm(n) { return (n || '').toLowerCase().replace(/[^a-z]/g, ''); }
+
+// ── Dream11 Fantasy Points ────────────────────────────────────────
+function fantasyPts(bat, bowl, inXI) {
+  let p = inXI ? 4 : 0;
+
+  // Batting
+  const r = bat.r || 0, b = bat.b || 0;
+  p += r;
+  p += (bat['4s'] || 0);        // 1 extra per boundary
+  p += (bat['6s'] || 0) * 2;    // 2 extra per six
+  if (r >= 100) p += 16;
+  else if (r >= 50) p += 8;
+  else if (r >= 30) p += 4;
+  const dismissed = bat.dismissal && !bat.dismissal.toLowerCase().includes('not out');
+  if (r === 0 && dismissed) p -= 2; // duck
+  if (b >= 10) {
+    const sr = (r / b) * 100;
+    if      (sr > 170) p += 6;
+    else if (sr > 150) p += 4;
+    else if (sr > 130) p += 2;
+    else if (sr <  50) p -= 6;
+    else if (sr <  60) p -= 4;
+    else if (sr <  70) p -= 2;
   }
-  if (bowl) {
-    pts += (bowl.wickets || 0) * 25;
-    if (bowl.wickets >= 5) pts += 16;
-    else if (bowl.wickets >= 4) pts += 8;
-    else if (bowl.wickets >= 3) pts += 4;
-    pts += (bowl.maidens || 0) * 8;
-    const eco = bowl.overs > 0 ? bowl.runs / bowl.overs : 99;
-    if (bowl.overs >= 2) {
-      if (eco < 5) pts += 6;
-      else if (eco < 6) pts += 4;
-      else if (eco < 7) pts += 2;
-      else if (eco >= 10 && eco < 11) pts -= 2;
-      else if (eco >= 11 && eco < 12) pts -= 4;
-      else if (eco >= 12) pts -= 6;
-    }
+
+  // Bowling
+  const w = bowl.w || 0, o = parseFloat(bowl.o) || 0, br = bowl.r || 0;
+  p += w * 25;
+  p += (bowl.maiden || 0) * 8;
+  if      (w >= 5) p += 8;
+  else if (w >= 4) p += 4;
+  else if (w >= 3) p += 4;
+  if (o >= 2) {
+    const eco = br / o;
+    if      (eco < 5)  p += 6;
+    else if (eco < 6)  p += 4;
+    else if (eco < 7)  p += 2;
+    else if (eco >= 10) p -= 6;
+    else if (eco >= 9)  p -= 4;
+    else if (eco >= 8)  p -= 2;
   }
-  if (field) {
-    pts += (field.catches || 0) * 8;
-    pts += (field.stumpings || 0) * 12;
-    pts += (field.runouts || 0) * 6;
-    if ((field.catches || 0) >= 3) pts += 4;
-  }
+
+  return Math.round(p);
+}
+
+function extractPlayerPts(scorecard) {
+  const pts = {}, seen = new Set();
+  (scorecard || []).forEach(inn => {
+    (inn.batting || []).forEach(b => {
+      const name = b.batsman?.name || b.name; if (!name) return;
+      const k = norm(name);
+      if (!seen.has(k)) { seen.add(k); pts[k] = (pts[k] || 0) + fantasyPts(b, {}, true); }
+      else pts[k] = (pts[k] || 0) + fantasyPts(b, {}, false);
+    });
+    (inn.bowling || []).forEach(bw => {
+      const name = bw.bowler?.name || bw.name; if (!name) return;
+      const k = norm(name);
+      pts[k] = (pts[k] || 0) + fantasyPts({}, bw, false);
+    });
+  });
   return pts;
 }
 
-function normName(n) {
-  return (n || "").toLowerCase().replace(/[^a-z]/g, "");
+function fmtScore(scores, idx) {
+  const s = (scores || [])[idx];
+  return s ? { s: `${s.r}/${s.w}`, o: String(s.o || '') } : { s: '', o: '' };
 }
 
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET");
+function toMatch(m, sc) {
+  const status = m.matchStarted && !m.matchEnded ? 'live'
+               : m.matchEnded ? 'completed' : 'upcoming';
+  const teams  = m.teams || [];
+  const { s: s1, o: o1 } = fmtScore(m.score, 0);
+  const { s: s2, o: o2 } = fmtScore(m.score, 1);
+  const toss = m.toss?.winner
+    ? `${m.toss.winner} won the toss, elected to ${m.toss.decision}`
+    : '';
+  const playerPoints = sc ? extractPlayerPts(sc.data?.scorecard) : {};
+  return {
+    id: m.id, t1: teams[0] || '', t2: teams[1] || '',
+    f1: teams[0] || '', f2: teams[1] || '',
+    s1, s2, o1, o2, status, toss,
+    date:   m.date   || '',
+    venue:  m.venue  || '',
+    result: m.status || '',
+    scorecard:    sc?.data?.scorecard || [],
+    playerPoints,
+  };
+}
 
-  if (cache.data && Date.now() - cache.ts < TTL)
-    return res.status(200).json({ source: "cache", ...cache.data });
+// ── Handler ───────────────────────────────────────────────────────
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  // Cache 15 min at Vercel CDN edge — keeps external API calls low
+  res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=1800');
+
+  if (!KEY) {
+    return res.json({
+      matches: [],
+      fetchedAt: Date.now(),
+      error: 'CRIC_API_KEY not set. Add it in Vercel → Settings → Environment Variables.',
+    });
+  }
 
   try {
-    const series = await j(`https://api.cricapi.com/v1/series_info?apikey=${KEY}&id=${IPL_ID}`);
-    const matchList = series?.data?.matchList ?? [];
+    // 1. Current live/recent matches
+    const cur = await get('/currentMatches?offset=0');
+    let iplMatches = (cur.data || []).filter(m =>
+      IPL.test(m.name || '') || IPL.test(m.seriesName || '')
+    );
 
-    const live     = matchList.filter(m => m.matchStarted && !m.matchEnded);
-    const done     = matchList.filter(m => m.matchEnded).slice(-5);
-    const upcoming = matchList.filter(m => !m.matchStarted).slice(0, 5);
-    const toFetch  = [...live, ...done, ...upcoming];
+    // 2. If < 3 matches found, search the series list for IPL schedule
+    if (iplMatches.length < 3) {
+      try {
+        const ser = await get('/series?offset=0');
+        const iplSeries = (ser.data || []).find(s => IPL.test(s.name || ''));
+        if (iplSeries) {
+          const info = await get(`/series_info?id=${iplSeries.id}`);
+          const all  = info.data?.matchList || [];
+          const existing = new Set(iplMatches.map(m => m.id));
+          all.forEach(m => { if (!existing.has(m.id)) iplMatches.push(m); });
+        }
+      } catch (e) { /* series lookup optional */ }
+    }
 
-    const details = await Promise.all(toFetch.map(m =>
-      j(`https://api.cricapi.com/v1/match_scorecard?apikey=${KEY}&id=${m.id}`)
-        .then(r => r.data)
-        .catch(() => null)
-    ));
-
-    const matches = details.filter(Boolean).map(d => {
-      const playerPts = {};
-
-      (d.scorecard || []).forEach(inn => {
-        (inn.batting || []).forEach(b => {
-          const key = normName(b.batsman?.name);
-          if (!key) return;
-          playerPts[key] = (playerPts[key] || 0) + calcPoints(
-            { runs: b.r, balls: b.b, fours: b["4s"], sixes: b["6s"] },
-            null, null
-          );
-        });
-        (inn.bowling || []).forEach(b => {
-          const key = normName(b.bowler?.name);
-          if (!key) return;
-          const overs = parseFloat(b.o) || 0;
-          playerPts[key] = (playerPts[key] || 0) + calcPoints(
-            null,
-            { wickets: b.w, runs: b.r, overs, maidens: b.m },
-            null
-          );
-        });
-      });
-
-      const s = d.score || [];
-      return {
-        id:          d.id,
-        no:          d.name?.match(/\d+/)?.[0] || "",
-        t1:          d.teams?.[0] || "",
-        t2:          d.teams?.[1] || "",
-        f1:          d.teams?.[0] || "",
-        f2:          d.teams?.[1] || "",
-        s1:          s[0] ? `${s[0].r}/${s[0].w}` : "",
-        o1:          s[0]?.o || "",
-        s2:          s[1] ? `${s[1].r}/${s[1].w}` : "",
-        o2:          s[1]?.o || "",
-        status:      d.matchStarted && !d.matchEnded ? "live"
-                     : d.matchEnded ? "completed" : "upcoming",
-        result:      d.status || "",
-        date:        d.dateTimeGMT?.slice(0, 10) || "",
-        venue:       d.venue || "",
-        toss:        d.tossWinner ? `${d.tossWinner} elected to ${d.tossChoice}` : "",
-        xi: {
-          announced: !!(d.teamInfo?.[0]?.players?.length),
-          t1: d.teamInfo?.[0]?.players?.map(p => p.name) || [],
-          t2: d.teamInfo?.[1]?.players?.map(p => p.name) || [],
-        },
-        playerPoints: playerPts,
-        scorecard:   d.scorecard || [],
-      };
+    // Sort: live → upcoming → completed
+    const order = { live: 0, upcoming: 1, completed: 2 };
+    iplMatches.sort((a, b) => {
+      const sa = a.matchStarted && !a.matchEnded ? 'live' : a.matchEnded ? 'completed' : 'upcoming';
+      const sb = b.matchStarted && !b.matchEnded ? 'live' : b.matchEnded ? 'completed' : 'upcoming';
+      return (order[sa] ?? 3) - (order[sb] ?? 3);
     });
 
-    const payload = { matches, fetchedAt: new Date().toISOString() };
-    cache = { data: payload, ts: Date.now() };
-    return res.status(200).json({ source: "live", ...payload });
+    // 3. Enrich started matches with scorecard (max 8 to conserve API quota)
+    const enriched = await Promise.all(
+      iplMatches.slice(0, 12).map(async m => {
+        let sc = null;
+        if (m.matchStarted) {
+          try { sc = await get(`/match_scorecard?id=${m.id}`); } catch (e) { /* ignore */ }
+        }
+        return toMatch(m, sc);
+      })
+    );
 
-  } catch (err) {
-    console.error(err);
-    if (cache.data) return res.status(200).json({ source: "stale", ...cache.data });
-    return res.status(500).json({ error: err.message });
+    res.json({ matches: enriched, fetchedAt: Date.now() });
+  } catch (e) {
+    console.error('scores handler error:', e);
+    res.status(500).json({ error: e.message, matches: [], fetchedAt: Date.now() });
   }
 }
