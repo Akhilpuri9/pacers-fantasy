@@ -260,9 +260,15 @@ function showErr(msg) {
   el.style.display = "block";
 }
 
+// ── FIX: showPage now forces inline display styles to override CSS specificity ──
 function showPage(pageId) {
-  document.querySelectorAll(".page").forEach(function(p) { p.classList.remove("active"); });
-  document.getElementById(pageId).classList.add("active");
+  document.querySelectorAll(".page").forEach(function(p) {
+    p.classList.remove("active");
+    p.style.display = "none";
+  });
+  var el = document.getElementById(pageId);
+  el.classList.add("active");
+  el.style.display = pageId === "auth-page" ? "flex" : "block";
 }
 
 // ── AUTH ──────────────────────────────────────────────────────────
@@ -288,16 +294,27 @@ function doAuth() {
   btn.textContent = "Please wait…";
 
   var ERRORS = {
-    "auth/user-not-found":       "No account found. Try Register.",
-    "auth/wrong-password":       "Incorrect password.",
-    "auth/invalid-email":        "Invalid email address.",
-    "auth/invalid-credential":   "Email or password is incorrect.",
-    "auth/too-many-requests":    "Too many attempts. Try again later.",
+    "auth/user-not-found":        "No account found. Try Register.",
+    "auth/wrong-password":        "Incorrect password.",
+    "auth/invalid-email":         "Invalid email address.",
+    "auth/invalid-credential":    "Email or password is incorrect.",
+    "auth/too-many-requests":     "Too many attempts. Try again later.",
     "auth/network-request-failed":"Network error. Check your connection.",
-    "auth/email-already-in-use": "Account exists. Try Sign In."
+    "auth/email-already-in-use":  "Account exists. Try Sign In.",
+    "auth/operation-not-allowed": "Email/Password sign-in is not enabled. Contact the admin."
   };
 
+  var timedOut = false;
+  var timeout = setTimeout(function() {
+    timedOut = true;
+    showErr("Request timed out. Please try again.");
+    btn.disabled = false;
+    btn.textContent = authMode === "login" ? "Sign In" : "Create Account";
+  }, 15000);
+
   function onSuccess(user) {
+    if (timedOut) return;
+    clearTimeout(timeout);
     currentUser = user;
     btn.disabled = false;
     btn.textContent = authMode === "login" ? "Sign In" : "Create Account";
@@ -311,8 +328,10 @@ function doAuth() {
   }
 
   function onError(e) {
+    if (timedOut) return;
+    clearTimeout(timeout);
     console.error("Auth error:", e.code, e.message);
-    showErr(ERRORS[e.code] || e.message);
+    showErr(ERRORS[e.code] || ("Error: " + e.message));
     btn.disabled = false;
     btn.textContent = authMode === "login" ? "Sign In" : "Create Account";
   }
@@ -322,7 +341,13 @@ function doAuth() {
       onSuccess(cred.user);
     }).catch(onError);
   } else {
-    if (!name) { showErr("Please enter a display name"); btn.disabled = false; btn.textContent = "Create Account"; return; }
+    if (!name) {
+      clearTimeout(timeout);
+      showErr("Please enter a display name");
+      btn.disabled = false;
+      btn.textContent = "Create Account";
+      return;
+    }
     auth.createUserWithEmailAndPassword(email, pass).then(function(cred) {
       return cred.user.updateProfile({ displayName: name }).then(function() {
         return db.collection("users").doc(cred.user.uid).set({ name: name, email: email, createdAt: new Date().toISOString() });
