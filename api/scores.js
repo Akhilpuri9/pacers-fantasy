@@ -106,36 +106,50 @@ function toMatch(m, sc) {
 // ── Handler ───────────────────────────────────────────────────────
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  // Cache 15 min at Vercel CDN edge — keeps external API calls low
-  res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=1800');
+  res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
 
   if (!KEY) {
-    return res.json({
-      matches: [],
-      fetchedAt: Date.now(),
-      error: 'CRICAPI_KEY not set. Add it in Vercel → Settings → Environment Variables.',
-    });
+    return res.json({ matches: [], fetchedAt: Date.now(), error: 'CRICAPI_KEY not set.' });
   }
 
+  const debug = req.query?.debug === 'true';
+
   try {
-    // 1. Current live/recent matches
+    // Step 1: try currentMatches
     const cur = await get('/currentMatches?offset=0');
-    let iplMatches = (cur.data || []).filter(m =>
-      IPL.test(m.name || '') || IPL.test(m.seriesName || '')
+    const allCurrent = cur.data || [];
+
+    if (debug) {
+      return res.json({ debug: true, currentMatches: allCurrent, seriesRaw: null });
+    }
+
+    let iplMatches = allCurrent.filter(m =>
+      IPL.test(m.name || '') ||
+      IPL.test(m.seriesName || '') ||
+      IPL.test(m.series_name || '') ||
+      IPL.test((m.series || {}).name || '')
     );
 
-    // 2. If < 3 matches found, search the series list for IPL schedule
-    if (iplMatches.length < 3) {
-      try {
-        const ser = await get('/series?offset=0');
-        const iplSeries = (ser.data || []).find(s => IPL.test(s.name || ''));
-        if (iplSeries) {
-          const info = await get(`/series_info?id=${iplSeries.id}`);
-          const all  = info.data?.matchList || [];
-          const existing = new Set(iplMatches.map(m => m.id));
-          all.forEach(m => { if (!existing.has(m.id)) iplMatches.push(m); });
-        }
-      } catch (e) { /* series lookup optional */ }
+    // Step 2: always also try series endpoint for full schedule
+    let seriesMatches = [];
+    try {
+      const ser = await get('/series?offset=0');
+      const iplSeries = (ser.data || []).find(s =>
+        IPL.test(s.name || '') || IPL.test(s.series_name || '')
+      );
+      if (iplSeries) {
+        const info = await get(`/series_info?id=${iplSeries.id}`);
+        seriesMatches = info.data?.matchList || info.data?.match_list || [];
+      }
+    } catch (e) { /* optional */ }
+
+    // Merge — series matches fill gaps
+    const existingIds = new Set(iplMatches.map(m => m.id));
+    seriesMatches.forEach(m => { if (!existingIds.has(m.id)) iplMatches.push(m); });
+
+    // If still nothing, just return all current matches (likely no IPL live right now)
+    if (!iplMatches.length) {
+      iplMatches = allCurrent;
     }
 
     // Sort: live → upcoming → completed
@@ -146,12 +160,12 @@ export default async function handler(req, res) {
       return (order[sa] ?? 3) - (order[sb] ?? 3);
     });
 
-    // 3. Enrich started matches with scorecard (max 8 to conserve API quota)
+    // Step 3: enrich with scorecards
     const enriched = await Promise.all(
       iplMatches.slice(0, 12).map(async m => {
         let sc = null;
         if (m.matchStarted) {
-          try { sc = await get(`/match_scorecard?id=${m.id}`); } catch (e) { /* ignore */ }
+          try { sc = await get(`/match_scorecard?id=${m.id}`); } catch (e) { }
         }
         return toMatch(m, sc);
       })
